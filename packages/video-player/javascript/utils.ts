@@ -89,16 +89,24 @@ export function normalizeInput(
  * @param maxTries - Maximum number of polling attempts
  * @param timeoutMs - Request timeout in milliseconds
  * @param fixedDelayMs - Fixed delay between attempts, or undefined for exponential backoff
+ * @param signal - Optional abort signal; a superseded source switch aborts its poll
  */
 export async function waitForVideoReady(
   url: string,
   maxTries: number,
   timeoutMs: number,
-  fixedDelayMs?: number
+  fixedDelayMs?: number,
+  signal?: AbortSignal
 ): Promise<void> {
   for (let attempt = 1; attempt <= maxTries; attempt++) {
+    if (signal?.aborted) {
+      throw new DOMException('Source switch superseded', 'AbortError');
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const onOuterAbort = () => controller.abort();
+    signal?.addEventListener('abort', onOuterAbort);
 
     let res: Response;
     try {
@@ -108,9 +116,14 @@ export async function waitForVideoReady(
       });
     } catch (err) {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onOuterAbort);
+      if (signal?.aborted) {
+        throw new DOMException('Source switch superseded', 'AbortError');
+      }
       return;
     }
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onOuterAbort);
 
     const parsedUrl = new URL(res.url);
     if (res.redirected && parsedUrl.searchParams.has('tr') && parsedUrl.searchParams.get('tr') === 'orig') {
@@ -118,7 +131,24 @@ export async function waitForVideoReady(
       const delay = fixedDelayMs != null
         ? fixedDelayMs
         : 10000 * Math.pow(2, attempt - 1);
-      await new Promise(r => setTimeout(r, delay));
+      await new Promise<void>(resolve => {
+        if (!signal) {
+          setTimeout(resolve, delay);
+          return;
+        }
+        const abortDelay = () => {
+          clearTimeout(delayTimer);
+          resolve();
+        };
+        const delayTimer = setTimeout(() => {
+          signal.removeEventListener('abort', abortDelay);
+          resolve();
+        }, delay);
+        signal.addEventListener('abort', abortDelay, { once: true });
+      });
+      if (signal?.aborted) {
+        throw new DOMException('Source switch superseded', 'AbortError');
+      }
       continue;
     } else {
       return;

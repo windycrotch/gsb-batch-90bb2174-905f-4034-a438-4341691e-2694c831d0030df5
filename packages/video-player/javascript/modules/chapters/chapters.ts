@@ -2,6 +2,18 @@ import type Player from 'video.js/dist/types/player';
 import type { SourceOptions, IKPlayerOptions } from '../../interfaces';
 import { ChapterMarker, parseChaptersFromVTT } from './chapterMarkerProgressBar';
 import { prepareChaptersVttSrc, CleanupRegistry } from '../../utils';
+import type { SourceSwitchGuard } from '../source-handler/source-switch';
+
+/**
+ * A switch guard that is always current. Used when chapters are initialised outside a
+ * source switch (there is then nothing that could supersede them).
+ */
+const ALWAYS_CURRENT: SourceSwitchGuard = {
+  id: -1,
+  isCurrent: () => true,
+  onSupersede: () => {},
+  offSupersede: () => {},
+};
 
 interface ChapterTrackMetadata {
   langCode: string;
@@ -87,6 +99,16 @@ function cleanupAllChapters(player: Player): void {
   }
 }
 
+/**
+ * Removes every piece of chapter UI owned by the current source: chapter text tracks
+ * (including the label display), the progress-bar markers and the hover tooltip, and
+ * the subtitle/chapter sync listener. Safe to call at the start of a new source switch.
+ */
+export function cleanupAllChapterUi(player: Player): void {
+  cleanupAllChapters(player);
+  chapterTracksCache.clear();
+}
+
 
 /**
  * Load chapters for a specific language
@@ -94,7 +116,8 @@ function cleanupAllChapters(player: Player): void {
 async function loadChaptersForLanguage(
   player: Player,
   vttUrl: string,
-  langCode: string = 'en'
+  langCode: string = 'en',
+  token: SourceSwitchGuard = ALWAYS_CURRENT
 ): Promise<ChapterMarker[]> {
   // Check cache first
   if (chapterTracksCache.has(langCode)) {
@@ -103,11 +126,18 @@ async function loadChaptersForLanguage(
 
   try {
     const res = await fetch(vttUrl);
+    if (!token.isCurrent()) {
+      return [];
+    }
     if (!res.ok) {
       player.log.warn(`Chapter VTT fetch failed for ${langCode} with status: (${res.status})`);
       return [];
     }
     const data = await res.text();
+    if (!token.isCurrent()) {
+      // A newer source switch owns the player; its chapter list must not pick up ours.
+      return [];
+    }
     const chapterList = parseChaptersFromVTT(data);
 
     // Cache the chapters
@@ -115,6 +145,9 @@ async function loadChaptersForLanguage(
 
     return chapterList;
   } catch (e) {
+    if (!token.isCurrent()) {
+      return [];
+    }
     player.log.error(`Failed to fetch chapters for ${langCode}: ${e}`);
     return [];
   }
@@ -323,11 +356,17 @@ function setupChapterLabelDisplay(player: Player, chaptersTrack: TextTrack): voi
  * 1. Auto-generate: chapters: true (with optional translations)
  * 2. VTT URL: chapters: { url: string }
  * 3. Manual object: chapters: { [timeInSec]: title }
+ *
+ * When `token` is supplied (the source switch that owns this source), the whole
+ * initialisation is gated on it: a slow chapter fetch from a superseded switch never
+ * applies markers to the new video. The markers it did add are torn down by the
+ * switch's start hook (`cleanupAllChapterUi`).
  */
 export async function initChapterMarkers(
   player: Player,
   source: SourceOptions | SourceOptions[] | null,
-  ikGlobalSettings: IKPlayerOptions
+  ikGlobalSettings: IKPlayerOptions,
+  token: SourceSwitchGuard = ALWAYS_CURRENT
 ): Promise<void> {
 
   // Clean up ALL chapters including persistent listeners for new source
@@ -336,6 +375,7 @@ export async function initChapterMarkers(
   // Clear cache for new source
   chapterTracksCache.clear();
 
+  if (!token.isCurrent()) return;
   if (!source) return;
 
   const src = Array.isArray(source) ? source[0] : source;
@@ -349,11 +389,21 @@ export async function initChapterMarkers(
         resolve();
         return;
       }
-      player.one('loadedmetadata', () => resolve());
+      const onLoadedMetadata = () => {
+        token.offSupersede?.(offSupersede);
+        resolve();
+      };
+      const offSupersede = () => {
+        player.off('loadedmetadata', onLoadedMetadata);
+        resolve();
+      };
+      player.one('loadedmetadata', onLoadedMetadata);
+      token.onSupersede(offSupersede);
     });
   }
 
   await waitForLoadedMetadata(player);
+  if (!token.isCurrent()) return;
 
   if (typeof src.chapters === 'object' && 'url' in src.chapters) {
     // Manual VTT URL - load directly
@@ -364,19 +414,24 @@ export async function initChapterMarkers(
         try {
           vttUrl = await ikGlobalSettings.signerFn(vttUrl);
         } catch (err) {
+          if (!token.isCurrent()) return;
           player.log.error(`Failed to sign chapter VTT URL: ${err instanceof Error ? err.message : String(err)}`);
           return;
         }
+        if (!token.isCurrent()) return;
       }
 
       const res = await fetch(vttUrl);
+      if (!token.isCurrent()) return;
       if (!res.ok) {
         player.log.warn(`VTT fetch failed with status: (${res.status}); skipping chapters.`);
         return;
       }
       const data = await res.text();
+      if (!token.isCurrent()) return;
       chapterList = parseChaptersFromVTT(data);
     } catch (e) {
+      if (!token.isCurrent()) return;
       player.log.error(`Failed to fetch chapters VTT: ${e instanceof Error ? e.message : String(e)}`);
       return;
     }
@@ -403,15 +458,18 @@ export async function initChapterMarkers(
     // Auto-generate chapters with translations support
     try {
       const { baseUrl, translatedUrls } = await prepareChaptersVttSrc(src, ikGlobalSettings);
+      if (!token.isCurrent()) return;
 
       // Load base language chapters
-      chapterList = await loadChaptersForLanguage(player, baseUrl, 'base');
+      chapterList = await loadChaptersForLanguage(player, baseUrl, 'base', token);
+      if (!token.isCurrent()) return;
 
       // Pre-load translated chapters in background
       if (translatedUrls.size > 0) {
         for (const [langCode, url] of translatedUrls.entries()) {
           // Load in background without blocking
-          loadChaptersForLanguage(player, url, langCode).catch(err => {
+          loadChaptersForLanguage(player, url, langCode, token).catch(err => {
+            if (!token.isCurrent()) return;
             player.log.warn(`Failed to pre-load chapters for ${langCode}:`, err);
           });
         }
@@ -420,10 +478,13 @@ export async function initChapterMarkers(
         setupSubtitleChapterSync(player);
       }
     } catch (e) {
+      if (!token.isCurrent()) return;
       player.log.error(`Failed to fetch default chapters VTT: ${e}`);
       return;
     }
   }
+
+  if (!token.isCurrent()) return;
 
   // Apply the base/default chapters
   if (chapterList.length > 0) {

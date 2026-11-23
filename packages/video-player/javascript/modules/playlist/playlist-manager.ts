@@ -283,9 +283,13 @@ export class PlaylistManager {
     // A user-chosen item replaces any pending auto-advance, so it can't skip ahead afterwards.
     this.autoAdvance_?.cancel();
     this.playlist_.setCurrentIndex(index);
-    this.player_.src(this.playlist_.getCurrentItem());
+    const item = this.playlist_.getCurrentItem();
+    this.player_.src(item);
 
+    // Only the item the viewer selected may start playback. If another item is chosen
+    // before this one's metadata arrives, this callback belongs to a superseded switch.
     this.player_.one('loadedmetadata', () => {
+      if (this.playlist_.getCurrentItem() !== item) return;
       this.player_.play();
     });
   }
@@ -429,6 +433,9 @@ export class PlaylistManager {
     this.player_.src(item);
 
     this.player_.ready(() => {
+      // A second selection may have replaced this one before the player was ready;
+      // the event must describe the item that is actually loading.
+      if (this.playlist_.getCurrentItem() !== item) return;
       this.player_.trigger('playlistitem', item);
     });
   }
@@ -470,7 +477,9 @@ export class PlaylistManager {
     const loadedNext = this.loadNextItem();
 
     if (loadedNext) {
+      const item = this.playlist_.getCurrentItem();
       this.player_.one('loadstart', () => {
+        if (this.playlist_.getCurrentItem() !== item) return;
         this.player_.play();
       });
     }

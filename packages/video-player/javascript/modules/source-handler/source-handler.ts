@@ -4,6 +4,7 @@ import type { AugmentedSourceOptions } from '../../interfaces/AugementedSourceOp
 import { waitForVideoReady, prepareSource, preparePosterSrc } from '../../utils';
 import { setTextTracks, validateRemoteTextTrackOptions } from '../subtitles/subtitles';
 import { hasPreparedSrc, ensurePrepared } from './source-helpers';
+import { SourceSwitchRegistry, type SourceSwitchGuard, type SourceSwitchToken } from './source-switch';
 
 /**
  * Options for creating a source override handler.
@@ -21,6 +22,23 @@ export interface SourceOverrideOptions {
   onOriginalSourceUpdate: (source: SourceOptions) => void;
   /** Function to check if a source has prepared src */
   hasPreparedSrc: (opts: SourceOptions) => opts is AugmentedSourceOptions;
+  /**
+   * Optional shared switch registry (owned by the plugin, so it can also be cancelled
+   * on dispose). One is created internally when omitted.
+   */
+  switchRegistry?: SourceSwitchRegistry;
+  /**
+   * Called synchronously as a new switch begins, before any asynchronous work. UI that
+   * belongs to the previous source (thumbnail containers, chapter markers, …) should be
+   * torn down here so it can never be mistaken for the incoming source.
+   */
+  onSwitchStart?: () => void;
+  /**
+   * Called once the prepared source has actually begun loading (Video.js `loadstart`),
+   * with the switch token. Source-dependent UI (chapters, recommendations, shoppable,
+   * seek thumbnails) is initialised from here, and must be gated on `token.isCurrent()`.
+   */
+  onSourceCommitted?: (source: SourceOptions, token: SourceSwitchGuard) => void;
 }
 
 // ImageKit ABS (ik-master.m3u8 / ik-master.mpd) renditions are always H.264 High + AAC.
@@ -130,15 +148,17 @@ async function prepareSourceIfNeeded(
 
 /**
  * Sets up text tracks (subtitles/captions) for the player from the current source.
+ * All work is gated on the switch token inside `setTextTracks`.
  */
 function setupTextTracks(
   player: Player,
   source: SourceOptions,
-  options: IKPlayerOptions
+  options: IKPlayerOptions,
+  token: SourceSwitchGuard
 ): void {
   const textTracks = source.textTracks || [];
   if (textTracks.length) {
-    setTextTracks(player, textTracks as RemoteTextTrackOptions[], source, options.signerFn);
+    setTextTracks(player, textTracks as RemoteTextTrackOptions[], source, options.signerFn, token);
   }
 }
 
@@ -148,30 +168,39 @@ function setupTextTracks(
 function setupPoster(
   player: Player,
   source: SourceOptions,
-  options: IKPlayerOptions
+  options: IKPlayerOptions,
+  token: SourceSwitchGuard
 ): void {
   const preparedPoster = (source as AugmentedSourceOptions | null | undefined)?.prepared?.poster;
-  
+
   if (preparedPoster) {
-    player.poster(preparedPoster);
-  } else {
-    preparePosterSrc(source, options).then(
-      poster => {
-        if (poster) {
-          player.poster(poster);
-        }
-        ensurePrepared(source as AugmentedSourceOptions).poster = poster ?? undefined;
-      }
-    ).catch(err => {
-      player.log.error(`Failed to load poster: ${err.message}`);
-    });
+    if (token.isCurrent()) player.poster(preparedPoster);
+    return;
   }
+
+  preparePosterSrc(source, options).then(
+    poster => {
+      // A later switch owns the UI now; its poster must not be overwritten by ours.
+      if (!token.isCurrent()) return;
+      if (poster) {
+        player.poster(poster);
+      }
+      ensurePrepared(source as AugmentedSourceOptions).poster = poster ?? undefined;
+    }
+  ).catch(err => {
+    if (!token.isCurrent()) return;
+    player.log.error(`Failed to load poster: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }
 
 /**
  * Creates a source override function that replaces Video.js's native src method.
  * This handles ImageKit source preparation, validation, and setup.
- * 
+ *
+ * Every call starts a new switch lifecycle. A switch owns the player UI only while it
+ * is the latest one; once superseded, all of its late asynchronous continuations
+ * (success and failure) are dropped instead of mutating the player.
+ *
  * @param player - The Video.js player instance
  * @param overrideOptions - Options for the source override
  * @returns A function that can be assigned to player.src
@@ -184,13 +213,42 @@ export function createSourceOverride(
   const nativeSrc = player.src.bind(player);
   // options({}) returns the merged player options; video.js's typings require an argument.
   const defaultNotSupportedMessage = player.options({}).notSupportedMessage;
-  let srcCallVersion = 0;
+  const switchRegistry = overrideOptions.switchRegistry ?? new SourceSwitchRegistry();
+
+  // The switch whose `nativeSrc` call the next `loadstart` belongs to. Because only
+  // the current switch ever calls `nativeSrc`, a `loadstart` from a stale tech load
+  // cannot be mistaken for the current switch's.
+  let pendingCommitToken: SourceSwitchToken | null = null;
+
+  const waitForCommittedLoad = (token: SourceSwitchToken, source: SourceOptions) => {
+    pendingCommitToken = token;
+    const onLoadStart = () => {
+      if (pendingCommitToken !== token) return;
+      pendingCommitToken = null;
+      player.off('loadstart', onLoadStart);
+      if (!token.isCurrent()) return;
+      try {
+        overrideOptions.onSourceCommitted?.(source, token);
+      } catch (err) {
+        // Committing the media source is this switch's job; a failure in the
+        // source-scoped UI initialiser must not break Video.js's own dispatch.
+        player.log.error(`Failed to initialise source UI: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    // If this switch is superseded before the source ever starts loading, stop waiting.
+    token.onSupersede(() => {
+      player.off('loadstart', onLoadStart);
+      if (pendingCommitToken === token) pendingCommitToken = null;
+    });
+    player.on('loadstart', onLoadStart);
+  };
 
   return (source?: SourceOptions) => {
     if (source === undefined) {
       return getOriginalCurrentSource();
     }
 
+    // Invalid input never starts a switch, so the source already playing is untouched.
     validateSourceOptions(source);
 
     // Clone the source immediately after validation to prevent mutating the original
@@ -198,18 +256,30 @@ export function createSourceOverride(
     onOriginalSourceUpdate({ ...sourceClone });
     onSourceUpdate({ ...sourceClone });
 
-    const myCallId = ++srcCallVersion;
+    const token = switchRegistry.begin();
 
-    showLoadingState(player);
+    // Tear down UI owned by the superseded source right away, before any waiting.
+    overrideOptions.onSwitchStart?.();
+
+    // The previous source's poster must not stay on screen as if it belonged to the
+    // incoming video. The new poster is set once this switch's poster is ready.
+    player.poster('');
 
     const currentSource = getCurrentSource();
     if (!currentSource) {
+      // Nothing to load; never leave the spinner up for a switch that cannot finish.
+      hideLoadingState(player);
       return;
     }
 
+    // A new switch replaces the previous load, including its error state, immediately.
+    // (`Player.error` accepts null to clear it, but its typings omit that overload.)
+    (player as any).error(null);
+    showLoadingState(player);
+
     prepareSourceIfNeeded(currentSource, options)
       .then(async (prepared: SourceOptions) => {
-        if (myCallId !== srcCallVersion) {
+        if (!token.isCurrent()) {
           return;
         }
 
@@ -225,8 +295,13 @@ export function createSourceOverride(
           prepared.src,
           maxTries!,
           videoTimeoutInMS!,
-          delayInMS
+          delayInMS,
+          token.signal
         );
+
+        if (!token.isCurrent()) {
+          return;
+        }
 
         // video.js raises its "no compatible source" error (code 4) with `notSupportedMessage`;
         // name the missing decoder instead when that is the cause.
@@ -235,18 +310,27 @@ export function createSourceOverride(
             ? UNSUPPORTED_ABS_CODEC_MESSAGE
             : defaultNotSupportedMessage,
         });
+
+        waitForCommittedLoad(token, prepared);
         nativeSrc(prepared as any);
 
-        setupTextTracks(player, prepared, options);
-        setupPoster(player, prepared, options);
+        if (!token.isCurrent()) {
+          return;
+        }
+
+        setupTextTracks(player, prepared, options, token);
+        setupPoster(player, prepared, options, token);
       })
       .catch(err => {
-        if (myCallId === srcCallVersion) {
-          player.error(err.message);
+        // A superseded switch must never raise an error over the new video.
+        if (token.isCurrent()) {
+          player.error(err instanceof Error ? err.message : String(err));
         }
       })
       .finally(() => {
-        if (myCallId === srcCallVersion) {
+        // Loading settles on success, failure and supersession (the superseding switch
+        // takes ownership of the indicator and will settle it itself).
+        if (token.isCurrent()) {
           hideLoadingState(player);
         }
       });

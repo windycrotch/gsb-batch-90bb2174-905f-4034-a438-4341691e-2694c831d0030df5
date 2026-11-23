@@ -8,7 +8,7 @@ import type { AugmentedSourceOptions } from './interfaces/AugementedSourceOption
 
 import { PlaylistManager } from './modules/playlist/playlist-manager';
 import { SeekThumbnailsManager } from './modules/seek-thumbnails/seek-thumbnails-manager';
-import { initChapterMarkers } from './modules/chapters/chapters';
+import { initChapterMarkers, cleanupAllChapterUi } from './modules/chapters/chapters';
 import './modules/recommendations-overlay/recommendations-overlay';
 import { ShoppableManager } from './modules/shoppable/shoppable-manager';
 import { validateIKPlayerOptions, CleanupRegistry } from './utils';
@@ -19,6 +19,7 @@ import { setupKeyboardShortcuts } from './modules/keyboard-shortcuts';
 import { setupMenuPlacement } from './modules/menu-placement';
 import { setupContextMenu } from './modules/context-menu/setup';
 import { createSourceOverride } from './modules/source-handler';
+import { SourceSwitchRegistry, type SourceSwitchGuard } from './modules/source-handler/source-switch';
 import { extendTrackSettings } from './modules/subtitles/track-settings-extension';
 import { createAnalyticsTracker, type AnalyticsTrackerHandle } from './modules/analytics/analytics-tracker';
 
@@ -46,6 +47,8 @@ class ImageKitVideoPlayerPlugin extends Plugin {
   private shoppableManager_?: ShoppableManager;
   private analyticsHandle_?: AnalyticsTrackerHandle;
   private cleanup_ = new CleanupRegistry();
+  // Owns the source switch lifecycle: one switch per player.src() call.
+  private switchRegistry_ = new SourceSwitchRegistry();
 
 
   constructor(player: Player, options: IKPlayerOptions) {
@@ -80,46 +83,6 @@ class ImageKitVideoPlayerPlugin extends Plugin {
           this.cleanup_.register(floatingCleanup);
         }
       }
-
-      this.player.on('loadstart', async () => {
-        if (this.seekThumbnailsManager_) {
-          this.seekThumbnailsManager_.destroy(this.player);
-          this.seekThumbnailsManager_ = undefined;
-        }
-
-        if (this.shoppableManager_) {
-          this.shoppableManager_.destroy();
-          this.shoppableManager_ = undefined;
-        }
-
-        const initPromises: Promise<void>[] = [];
-
-        if (this.ikGlobalSettings_.seekThumbnails && this.currentSource_) {
-          initPromises.push(
-            SeekThumbnailsManager.initSeekThumbnails(
-              this.player,
-              this.currentSource_,
-              this.ikGlobalSettings_
-            ).then(mgr => {
-              if (mgr) {
-                this.seekThumbnailsManager_ = mgr;
-              }
-            })
-          );
-        }
-
-        initPromises.push(
-          initChapterMarkers(this.player, this.currentSource_, this.ikGlobalSettings_)
-        );
-
-        initPromises.push(this.initRecommendationsOverlay());
-
-        if (this.currentSource_?.shoppable) {
-          this.shoppableManager_ = new ShoppableManager(this.player, this.currentSource_);
-        }
-
-        await Promise.all(initPromises);
-      });
 
       this.player.ready(() => {
         const playerEl = this.player.el();
@@ -173,10 +136,16 @@ class ImageKitVideoPlayerPlugin extends Plugin {
   /**
    * Overrides the Video.js src method to handle ImageKit source preparation,
    * including URL signing, transformations, and ABS (HLS/DASH) support.
+   *
+   * Each call to `player.src(...)` is one source switch. Everything that the switch
+   * creates (chapters, seek thumbnails, recommendations, shoppable UI, subtitles) is
+   * scoped to it: when the next switch begins, the old UI is torn down and any late
+   * async result from the old switch is discarded instead of landing on the new video.
    */
   private overrideSrc() {
     this.player.src = createSourceOverride(this.player, {
       options: this.ikGlobalSettings_,
+      switchRegistry: this.switchRegistry_,
       getCurrentSource: () => {
         return this.currentSource_;
       },
@@ -192,21 +161,89 @@ class ImageKitVideoPlayerPlugin extends Plugin {
       hasPreparedSrc: (opts: SourceOptions): opts is AugmentedSourceOptions => {
         return (opts as any).prepared && typeof (opts as any).prepared.src === 'string';
       },
+      onSwitchStart: () => this.teardownSourceScopedUi_(),
+      onSourceCommitted: (source, token) => this.initSourceScopedUi_(source, token),
     }) as any;
+  }
+
+  /**
+   * Tears down all UI that belonged to the previous source. Called synchronously as the
+   * next switch begins, so stale thumbnails/chapters/overlays can never be displayed
+   * for (or interact with) the incoming video.
+   */
+  private teardownSourceScopedUi_() {
+    if (this.seekThumbnailsManager_) {
+      this.seekThumbnailsManager_.destroy(this.player);
+      this.seekThumbnailsManager_ = undefined;
+    }
+
+    if (this.shoppableManager_) {
+      this.shoppableManager_.destroy();
+      this.shoppableManager_ = undefined;
+    }
+
+    // Chapters live on the player itself (text track + control bar component).
+    cleanupAllChapterUi(this.player);
+
+    // Always drop the previous source's overlay, so its recommendations can't show
+    // at the end of a later video that has none of its own.
+    const overlay = this.player.getChild('RecommendationsOverlay');
+    if (overlay) overlay.dispose();
+  }
+
+  /**
+   * Initialises UI that depends on the source that has just begun loading. Every step
+   * is gated on `token`, so a superseded switch's late results are dropped.
+   */
+  private initSourceScopedUi_(source: SourceOptions, token: SourceSwitchGuard): void {
+    const initPromises: Promise<void>[] = [];
+
+    if (this.ikGlobalSettings_.seekThumbnails) {
+      initPromises.push(
+        SeekThumbnailsManager.initSeekThumbnails(
+          this.player,
+          source,
+          this.ikGlobalSettings_,
+          token
+        ).then(mgr => {
+          if (mgr && token.isCurrent()) {
+            this.seekThumbnailsManager_ = mgr;
+          }
+        })
+      );
+    }
+
+    initPromises.push(
+      initChapterMarkers(this.player, source, this.ikGlobalSettings_, token)
+    );
+
+    initPromises.push(this.initRecommendationsOverlay(source, token));
+
+    if (source.shoppable && token.isCurrent()) {
+      this.shoppableManager_ = new ShoppableManager(this.player, source);
+    }
+
+    // Each init step handles its own failures; nothing here should surface as an
+    // unhandled rejection.
+    void Promise.all(initPromises);
   }
 
 
   /**
    * Initializes the recommendations overlay if recommendations are provided in the source.
+   * Only applies while `token` is the current source switch.
    */
-  private async initRecommendationsOverlay() {
+  private async initRecommendationsOverlay(source: SourceOptions, token: SourceSwitchGuard) {
+    if (!token.isCurrent()) return;
+
     // Always drop the previous source's overlay, so its recommendations can't show
     // at the end of a later video that has none of its own.
     const overlay = this.player.getChild('RecommendationsOverlay');
     if (overlay) overlay.dispose();
 
-    if (!this.currentSource_ || !this.currentSource_.recommendations) return;
-    this.player.addChild('RecommendationsOverlay', { recommendations: this.currentSource_.recommendations, playerOptions: this.ikGlobalSettings_ });
+    if (!source.recommendations) return;
+    if (!token.isCurrent()) return;
+    this.player.addChild('RecommendationsOverlay', { recommendations: source.recommendations, playerOptions: this.ikGlobalSettings_ });
   }
 
   /**
@@ -254,6 +291,8 @@ class ImageKitVideoPlayerPlugin extends Plugin {
    * Clean up all event listeners and resources when the plugin is disposed.
    */
   dispose(): void {
+    // Abort any in-flight switch so its continuations can't touch the disposed player.
+    this.switchRegistry_.cancel();
     this.cleanup_.dispose();
     super.dispose();
   }

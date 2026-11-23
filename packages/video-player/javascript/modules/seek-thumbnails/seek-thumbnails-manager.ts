@@ -2,8 +2,20 @@ import videojs from 'video.js';
 import type Player from 'video.js/dist/types/player';
 import type { IKPlayerOptions, SourceOptions } from '../../interfaces';
 import { prepareSeekThumbnailVttSrc } from '../../utils';
+import type { SourceSwitchGuard } from '../source-handler/source-switch';
 
 const log = videojs.log.createLogger('videojs-seek-thumbnail');
+
+/**
+ * A switch guard that is always current. Used when seek thumbnails are initialised
+ * outside a source switch (there is then nothing that could supersede them).
+ */
+const ALWAYS_CURRENT: SourceSwitchGuard = {
+  id: -1,
+  isCurrent: () => true,
+  onSupersede: () => {},
+  offSupersede: () => {},
+};
 
 /**
  * Cue parsed from WebVTT.
@@ -24,23 +36,33 @@ export class SeekThumbnailsManager {
   /**
    * Build a new manager, fetch VTT, parse cues, create a container, and attach hover handlers.
    * Returns the newly created instance so the caller can store it.
+   *
+   * `token` is the source switch that owns this source. If it is superseded while the
+   * VTT is fetching, nothing is created and `null` is returned; anything that was
+   * created is registered as cleanup so the superseding switch starts from a clean slate.
    */
   static async initSeekThumbnails(
     player: Player,
     source: SourceOptions,
-    playerOptions: IKPlayerOptions
+    playerOptions: IKPlayerOptions,
+    token: SourceSwitchGuard = ALWAYS_CURRENT
   ): Promise<SeekThumbnailsManager | null> {
     try {
+      if (!token.isCurrent()) return null;
+
       // 1) Build the VTT URL
       const manifestUrl = await prepareSeekThumbnailVttSrc(source, playerOptions);
+      if (!token.isCurrent()) return null;
 
       log.debug('Fetching VTT →', manifestUrl);
       const resp = await fetch(manifestUrl);
+      if (!token.isCurrent()) return null;
       if (!resp.ok) {
         log.warn(`VTT fetch failed (${resp.status}); skipping seek thumbnails.`);
         return null;
       }
       const vttText = await resp.text();
+      if (!token.isCurrent()) return null;
 
       // 2) Parse cues
       const cues = parseWebVTT(vttText);
@@ -90,9 +112,13 @@ export class SeekThumbnailsManager {
       progress.on('mousemove', mgr.mouseMoveHandler);
       progress.on('mouseleave', mgr.mouseLeaveHandler);
 
+      // A superseded switch must not leave its thumbnail container or handlers behind.
+      token.onSupersede(() => mgr.destroy(player));
+
       log.debug('SeekThumbnailsManager initialized');
       return mgr;
     } catch (err) {
+      if (!token.isCurrent()) return null;
       log.error('Error initializing seek thumbnails:', err);
       return null;
     }

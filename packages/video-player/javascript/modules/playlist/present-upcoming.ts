@@ -138,20 +138,25 @@ export class PresentUpcoming extends Component {
     }
     this.item_ = item;
 
-    // Clear previous thumbnail
+    // Clear previous thumbnail and any failure state left by an earlier item.
     this.thumbnailEl_.innerHTML = '';
+    this.thumbnailEl_.classList.remove('vjs-playlist-thumbnail-placeholder');
     const title = item.info?.title || this.localize('Untitled Video');
     this.title_ = title;
     this.titleEl_.textContent = this.localize('Next up: {1}', [title]);
 
     try {
       const posterUrl = await preparePosterSrc(item, this.playerOptions_);
+      // The card moved on to a different item (or was disposed) while the poster was
+      // loading; this result belongs to a video the viewer is no longer being offered.
+      if (this.item_ !== item || !this.el_) return;
       const img = document.createElement('img');
       img.src = posterUrl;
       // Decorative: the title right below already names the "play next" button.
       img.alt = '';
       this.thumbnailEl_.appendChild(img);
     } catch (e) {
+      if (this.item_ !== item || !this.el_) return;
       this.thumbnailEl_.classList.add('vjs-playlist-thumbnail-placeholder');
       this.player_.log.error('Failed to load "Up Next" poster:', e);
     }

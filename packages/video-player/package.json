@@ -40,7 +40,8 @@
     "build:assets": "cp -r javascript/assets dist/ && mkdir -p dist/astro && cp astro/IKVideoPlayer.astro dist/astro/IKVideoPlayer.astro",
     "dev": "yarn run build && (yarn run dev:tsup & yarn run dev:css)",
     "dev:tsup": "tsup --tsconfig tsconfig.tsup.json --watch",
-    "dev:css": "sass --watch --load-path=./node_modules javascript/styles/index.scss dist/styles.css"
+    "dev:css": "sass --watch --load-path=./node_modules javascript/styles/index.scss dist/styles.css",
+    "test:source-switch": "yarn run build && node test-harness/run.mjs"
   },
   "peerDependencies": {
     "astro": ">=3.2.0",
