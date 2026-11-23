@@ -158,10 +158,12 @@ class Instrument extends ModulatorSet {
     playWith(usage, enable) {
         switch (usage) {
             case soundDefinitionSet.playControl.usage.frequencyModulation:
+                super.frequencyModulationEnable = enable; // instrument-level (absolute-frequency) modulators
                 for (let [_, tone] of this.#implementation.tones)
                     tone.frequencyModulationEnable = enable;
                 return;
             case soundDefinitionSet.playControl.usage.amplitudeModulation:
+                super.amplitudeModulationEnable = enable; // instrument-level (absolute-frequency) modulators
                 for (let [_, tone] of this.#implementation.tones)
                     tone.amplitudeModulationEnable = enable;
                 return;
@@ -188,6 +190,23 @@ class Instrument extends ModulatorSet {
     } //playWith
 
     set data(dataset) {
+        // validate everything before changing any state, so a rejected dataset
+        // leaves the previously applied instrument fully intact:
+        const invalid = reason => new Error(`Invalid instrument data: ${reason}`);
+        if (!dataset) throw invalid("dataset is not defined");
+        if (!dataset.oscillator) throw invalid("oscillator is not defined");
+        if (!dataset.oscillator.type && !dataset.oscillator.Fourier) throw invalid("oscillator Fourier data is not defined");
+        const validEnvelope = envelope => envelope && Array.isArray(envelope.stages);
+        if (!validEnvelope(dataset.gainEnvelope)) throw invalid("gain envelope is not defined or malformed");
+        if (!validEnvelope(dataset.detuneEnvelope)) throw invalid("detune envelope is not defined or malformed");
+        const validModulation = modulation =>
+            modulation &&
+            modulation.absoluteFrequency && Array.isArray(modulation.absoluteFrequency.modes) &&
+            modulation.relativeFrequency && Array.isArray(modulation.relativeFrequency.modes) &&
+            validEnvelope(modulation.envelope);
+        if (!validModulation(dataset.frequencyModulation)) throw invalid("frequency modulation data is not defined or malformed");
+        if (!validModulation(dataset.amplitudeModulation)) throw invalid("amplitude modulation data is not defined or malformed");
+        if (!Array.isArray(dataset.filter)) throw invalid("filter data is not defined or malformed");
         this.#implementation.lastDataset = dataset;
         if (dataset.gainCompensation && dataset.gainCompensation.middleFrequency)
             this.#implementation.setGainCompensation(dataset.gainCompensation, true);
@@ -199,9 +218,7 @@ class Instrument extends ModulatorSet {
         super.frequencyModulationData = dataset.frequencyModulation.absoluteFrequency;
         super.amplitudeModulationData = dataset.amplitudeModulation.absoluteFrequency;
         for (let [_, tone] of this.#implementation.tones) {
-            tone.data = dataset;
-            tone.frequencyModulationData = dataset.frequencyModulation.relativeFrequency;
-            tone.amplitudeModulationData = dataset.amplitudeModulation.relativeFrequency;
+            tone.data = dataset; // also assigns the relative-frequency modulation data
             tone.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
             super.connectToAudioParameters(tone.frequencyModulatorTarget, tone.amplitudeModulatorTarget);
         } //loop

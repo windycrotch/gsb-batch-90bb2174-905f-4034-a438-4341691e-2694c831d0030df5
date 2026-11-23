@@ -166,19 +166,12 @@ window.onload = () => {
             //
             const loadModel = (fileName, text) => {
                 clearException();
+                let loadedModel;
                 try {
-                    singleton.model = JSON.parse(text);
-                    if (!singleton.model.header)
-                        throw new Error(`header should be specified`);
-                    const loadedFormatVersion = parseFloat(singleton.model.header.formatVersion);
-                    if (Number.isNaN(loadedFormatVersion))
-                        throw new Error(`invalid format version: "${singleton.model.header.formatVersion}"`);
-                    const currentFormatVersion = parseFloat(definitionSet.formatVersion);
-                    if ((currentFormatVersion >= loadedFormatVersion) != true) //sic!
-                        throw new Error(
-                            `File format version should be lower or equal to ${definitionSet.formatVersion}, ` +
-                            `otherwise newer version of the application might be required`);
+                    loadedModel = instrumentModelIO.parseInstrumentFile(text, definitionSet.formatVersion);
                 } catch (ex) {
+                    // nothing was touched: the view, the singleton model and the
+                    // currently sounding instrument keep the last successfully applied state
                     setExceptionMessage(ex, "Error loading file");
                     return;
                 } //exception
@@ -187,10 +180,7 @@ window.onload = () => {
                         if (controls.tables[tableIndex].reset)
                             controls.tables[tableIndex].reset();
                 })();
-                setTimeout(() => {
-                    singleton.modelToView();
-                    apply();
-                });
+                setTimeout(() => instrumentModelIO.applyLoadedModel(singleton, loadedModel, apply));
                 singleton.lastFileName = fileName;
             }; //loadModel
             const storeModel = () => {

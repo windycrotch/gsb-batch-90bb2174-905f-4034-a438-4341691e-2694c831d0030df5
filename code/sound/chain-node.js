@@ -24,6 +24,7 @@ class ChainNode {
                 this.#implementation.upstream.connect(this.#implementation.target);
         } //this.#implementation.connect
         this.#implementation.setEnabled = doEnable => {
+            this.#implementation.isEnabled = doEnable; // always record the state, even if there is nothing to rewire yet
             if (this.#implementation.collection.length < 1) return;
             if (!doEnable) {
                 this.#implementation.upstream.disconnect();
@@ -31,7 +32,6 @@ class ChainNode {
                 this.#implementation.upstream.connect(this.#implementation.target);
             } else
                 this.#implementation.connect();
-            this.#implementation.isEnabled = doEnable;
         }; //this.#implementation.setEnabled
         this.#implementation.deactivate = _ => {
             for (let node of this.#implementation.collection)

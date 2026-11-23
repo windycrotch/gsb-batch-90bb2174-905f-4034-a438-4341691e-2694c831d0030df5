@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+
+<!--
+// Microtonal Fabric
+//
+// Copyright (c) Sergey A Kryukov, 2017-2021
+//
+// http://www.SAKryukov.org
+// http://www.codeproject.com/Members/SAKryukov
+// https://github.com/SAKryukov
+// https://github.com/SAKryukov/microtonal-fabric
+
+// Automated Sound Builder tests.
+// Open this file in a browser, or run "node run-tests.js"
+// to execute the tests in a headless browser automatically.
+-->
+
+<html lang="en-us">
+<head>
+    <title>Sound Builder Tests</title>
+    <meta charset="utf-8"/>
+    <!-- engine dependencies: -->
+    <script src="../../agnostic/enumeration.js"></script>
+    <script src="../../sound/definition-set.js"></script>
+    <script src="../../SoundBuilder/main/default-instrument.js"></script>
+    <!-- the mock replaces the Web Audio constructors before the engine is instantiated: -->
+    <script src="mock-audio.js"></script>
+    <!-- the sound engine under test: -->
+    <script src="../../sound/modulator.js"></script>
+    <script src="../../sound/modulator-set.js"></script>
+    <script src="../../sound/chain-node.js"></script>
+    <script src="../../sound/envelope.js"></script>
+    <script src="../../sound/tone.js"></script>
+    <script src="../../sound/instrument.js"></script>
+    <!-- the model load/apply logic under test: -->
+    <script src="../../SoundBuilder/main/model-io.js"></script>
+</head>
+<body>
+    <h1>Sound Builder &mdash; automated tests</h1>
+    <script src="tests.js"></script>
+</body>
+</html>
